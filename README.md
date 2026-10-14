@@ -5,6 +5,8 @@ of libvirt virtual machines. A central Command Control service accepts operator
 requests and selects capacity; a scheduler agent on each hypervisor owns local
 resource reservations and VM reconciliation. An IPAM integration reserves and
 releases VM addresses as part of provisioning.
+VM roles (`master`, `worker`, and `infra`) support workload affinity and
+anti-affinity placement rules.
 
 ## Planned components
 

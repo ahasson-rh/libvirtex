@@ -55,6 +55,8 @@ Build a fake IPAM adapter with independently exhaustible subnets. Cover:
   second HSM.
 - Several HSMs on one exhausted subnet; CCM skips all of them for that
   generation.
+- A fallback offer that violates a hard role-based affinity or anti-affinity
+  rule is skipped even when its subnet has free addresses.
 - All eligible subnets exhausted; all reservations are released and no VM is
   created.
 - IPAM success after fallback; exactly one lease, placement, VM Agent, and

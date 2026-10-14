@@ -84,9 +84,9 @@ Persist immutable IDs and explicit state transitions. Core records are:
   allocatable limits, capabilities, IPAM subnet ID/prefix, agent identity, and
   last heartbeat. One enabled hypervisor maps to one IPAM allocation subnet.
 - `VMRequest`: ID, caller/idempotency key, requested RAM/vCPUs, network/image
-  specification, required/preferred host labels, workload-affinity or
-  anti-affinity rules, desired state (`running` or `absent`), and lifecycle
-  state.
+  specification, VM role (`master`, `worker`, or `infra`), workload ID,
+  required/preferred host labels, workload-affinity or anti-affinity rules,
+  desired state (`running` or `absent`), and lifecycle state.
 - `SchedulingRequest`: an immutable request generation in the distributed
   shared registry, offer deadline, eligible-affinity rules, offers, IPAM
   attempt count, and subnets excluded for this generation.
@@ -99,10 +99,12 @@ Persist immutable IDs and explicit state transitions. Core records are:
   ID, hypervisor ID, and IPAM subnet ID. Store no provider secrets in this
   record.
 - `VMRecord`: VM request ID, domain identity, elected HSM, reservation and
-  lease references, desired/observed state, and placement generation. It is
-  owned locally by that VM's HSM agent and replicated as cluster state.
+  lease references, role, workload ID, desired/observed state, and placement
+  generation. It is owned locally by that VM's HSM agent and replicated as
+  cluster state.
 - `Operation`: durable workflow step, retry count, error, timestamps, and an
-  idempotency key for every remote action.
+  idempotency key for every remote action. Later parallel processing also adds
+  a request-generation ownership lease and worker identity.
 - `IPAMAttempt`: request generation, HSM/subnet, idempotency key, outcome, and
   provider error category. `subnet_exhausted` is distinct from transient and
   authentication/provider errors.
@@ -111,6 +113,27 @@ Suggested lifecycle: `requested -> placing -> reserved -> ip_reserved ->
 provisioning -> running`; failures move to `failed` after compensating release
 of reservation and unconfirmed lease. Deletion is `deleting -> absent`. A
 running VM whose agent disappears becomes `unknown`, not immediately deleted.
+
+## VM Roles and Placement Topology
+
+Every VM has exactly one role: `master`, `worker`, or `infra`. A request also
+has a workload ID, allowing rules to target a subset of VMs belonging to the
+same workload. Rules use explicit selectors such as a workload ID plus one or
+more roles. `same_hypervisor` requires selected VMs to share a host;
+`different_hypervisor` requires them to be on different hosts. For example, a
+workload can colocate its `master` and `infra` VMs while requiring every
+`worker` to be separate from `master`; any combination of the three roles can
+be expressed by composing selectors and rules.
+
+CCM validates contradictory rules before publishing a request. HSM evaluates
+hard rules against committed placements and active offers from Mnesia, then
+atomically records topology claims with its provisional resource reservation.
+This prevents concurrent offers from bypassing anti-affinity. Soft preferences
+may influence CCM's deterministic election score but never override a hard
+constraint. When a request specifies no affinity or anti-affinity rule, it has
+no topology constraint: every otherwise eligible hypervisor may offer, and CCM
+uses its normal capacity/utilization election policy. Initial scope applies
+rules within one workload; cross-workload selectors are a later extension.
 
 ## Scheduling, Offers, and Reservation Protocol
 
@@ -136,10 +159,10 @@ reservation in their own durable ledger.
    recently healthy HSMs matching required labels/capabilities consider it.
 2. Each matching HSM evaluates observed libvirt usage plus committed and
    provisional reservations against its configured limits. It also evaluates
-   workload affinity/anti-affinity from the request and its locally known VM
-   placements. If eligible, it atomically records a held reservation and writes
-   an idempotent offer to the registry; otherwise it may record a diagnostic
-   rejection.
+   workload affinity/anti-affinity from the request and Mnesia placement
+   records. If eligible, it atomically records a held resource/topology
+   reservation and writes an idempotent offer to the registry; otherwise it may
+   record a diagnostic rejection.
 3. Several HSMs may offer for the same request. After the deadline, or once
    policy permits early election, CCM alone chooses one offer deterministically.
    The initial policy honors hard affinity, prefers lowest projected
@@ -302,14 +325,24 @@ host drain, and failure dashboards. Test duplicate and delayed messages,
 control-service restart at each workflow step, IPAM failure compensation,
 network partition/rejoin, and agent restart recovery.
 
-### Phase 3 — Fleet and provisioning
+### Phase 3 — VM roles and workload topology
+
+Add the `master`, `worker`, and `infra` role model, workload IDs, selector-based
+`same_hypervisor`/`different_hypervisor` rules, validation, and Mnesia topology
+claims. Extend HSM admission so resource and hard-topology claims are one
+atomic operation. Extend CCM election scoring with soft preferences and show
+role/topology decisions in the UI and audit trail. Test all role combinations,
+conflicting rules, concurrent offers, restart recovery, and IPAM fallback where
+only a topology-valid alternate HSM may be elected.
+
+### Phase 4 — Fleet and provisioning
 
 Support multiple agents, utilization-aware ranking, inventory source refresh,
 and a provider-backed hypervisor provisioner. Add admission limits, provisioning
 quotas, decommission/drain workflow, capacity reporting, and load/failure tests
 at representative fleet size.
 
-### Phase 4 — Advanced capacity policy
+### Phase 5 — Advanced capacity policy
 
 Add explicit, opt-in CPU and memory overcommit policies only after baseline
 reservation correctness is established. Policies must be per-hypervisor or
@@ -332,6 +365,8 @@ default or silently reinterpret existing RAM/vCPU requests.
 - Each managed VM has exactly one supervised VM Agent on its elected HSM; agent
   restart or HSM restart recovers from the VM record without creating a second
   domain.
+- Hard role-based affinity and anti-affinity rules are honored during both
+  normal and IPAM-fallback election; an invalid alternate HSM is never chosen.
 - A successfully created VM has one recorded placement and one confirmed IPAM
   lease; failed workflows leave neither active reservation nor leaked lease.
 - Scheduler and control-service restarts recover in-progress operations without
