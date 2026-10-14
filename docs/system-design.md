@@ -350,6 +350,24 @@ host class, advertise separate physical and allocatable limits, and be visible
 in offers, election, UI, audit events, and metrics. Never enable overcommit by
 default or silently reinterpret existing RAM/vCPU requests.
 
+### Phase 6 — Parallel CCM request processing
+
+Add a configurable, supervised CCM workflow-worker pool (for example, a
+`DynamicSupervisor` of request workers) so independent VM requests can advance
+in parallel. Before a worker performs an external action, it must acquire a
+generation-scoped ownership lease in a Mnesia transaction and renew it while
+active. A unique Mnesia transition from `open` to `elected` still makes CCM the
+sole logical election authority even when multiple workers race for work; only
+one worker can own or elect a particular request generation.
+
+Workers must use existing idempotency keys for HSM/IPAM calls, record each
+handoff/retry in `Operation`, and resume expired leases after a worker crash.
+Bound the pool and external-call concurrency separately to protect IPAM and
+HSMs. Load-test many independent requests, duplicate delivery, worker crash at
+every workflow step, lease expiry, and concurrent attempts to elect the same
+request. This phase introduces no parallelism within a single VM request's
+state machine.
+
 ## Acceptance Criteria for the First Release
 
 - An operator can request and delete a VM through the control API; both calls
