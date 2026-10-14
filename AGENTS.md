@@ -10,6 +10,12 @@ runtime configuration belongs in `config/config.exs`. The repository currently
 contains only the umbrella skeleton, so create application and test directories
 as features are added.
 
+Create every new umbrella application from the repository root with Mix, for
+example `mix new apps/command_control_module --sup` or
+`mix new apps/hypervisor_scheduler_module --sup`. Use `--sup` for OTP
+applications that own processes; keep the generated `mix.exs` inside the app
+and then run root-level `mix compile` to confirm umbrella discovery.
+
 ## Build, Test, and Development Commands
 
 - `mix deps.get` fetches root-level dependencies.
