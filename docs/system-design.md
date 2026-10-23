@@ -2,11 +2,11 @@
 
 ## Purpose and Scope
 
-Libvirtex schedules libvirt VMs onto a known inventory of hypervisors. It
-begins with static inventory but can request a new hypervisor through a
-pluggable provisioner when existing eligible capacity is exhausted. The system
-tracks allocatable RAM and vCPUs, manages an IPAM lease per VM, and gives
-operators a central web/API control plane.
+Libvirtex schedules libvirt VMs onto a configured inventory of hypervisors.
+Each Hypervisor Scheduler Module (HSM) registers itself with the Command
+Control Module (CCM) before it is eligible for placement. The system tracks
+allocatable RAM and vCPUs, manages an IPAM lease per VM, and gives operators a
+central web/API control plane.
 
 The system is deliberately kept lightweight, not a general cluster orchestrator:
 there is no VM live migration, distributed storage management, automatic VM rescheduling
@@ -39,7 +39,6 @@ Operator / automation
 CommandControlModule (Podman on bastion) ---- PostgreSQL (separate Podman container + local volume)
    |        |       \
    |        |        \-- IPAM provider
-   |        +----------- hypervisor provisioner (optional)
    |        +----------- CoreDNS Corefile record manager
    |
  libcluster / distributed Erlang / shared request registry
@@ -51,8 +50,9 @@ DynamicSupervisor -> VM Agent (one per managed VM) -> libvirt local socket/API
                                                 libvirtd ---- VMs
 ```
 
-`CommandControlModule` is the source of truth for inventory, VM desired state,
-workflow progress, placements, and IPAM lease references. Each
+`CommandControlModule` is the source of truth for the loaded inventory, VM
+desired state, workflow progress, placements, and IPAM lease references. CCM
+receives the authoritative inventory-file path as configuration. Each
 `HypervisorSchedulerModule` is authoritative only for whether its host can
 honor a reservation and for observed local VM state. HSM continuously reports
 reservation and observed-resource changes; CCM maintains the fleet-wide tracker
@@ -69,10 +69,9 @@ the HSM's atomic local reservation ledger is authoritative for a host.
 | `libvirtex_cluster` | libcluster topology, node naming, Mnesia schema/tables, cluster event handling, and shared-registry interface | libvirt calls or host-local resource admission |
 | `libvirtex_ipam` | `IPAM` behaviour and adapters for reserve, confirm, release, lookup | placement decisions or VM creation |
 | `libvirtex_dns` | `DNSRecords` behaviour and adapters that inject/delete managed VM records in the CoreDNS Corefile | DNS service provisioning, zone delegation, or arbitrary Corefile configuration |
-| `libvirtex_provisioner` | `Provisioner` behaviour and adapters that create/register hosts | host scheduling policy |
 
-Start `libvirtex_core` as an independent app. Keep the IPAM and provisioner
-apps independent when adapters are expected to be reusable or have their own
+Start `libvirtex_core` as an independent app. Keep the IPAM and DNS apps
+independent when adapters are expected to be reusable or have their own
 dependencies; otherwise begin as implementations beneath the control module
 and extract without changing the core behaviour contracts.
 
@@ -85,7 +84,7 @@ rejoin synchronization.
 
 Persist immutable IDs and explicit state transitions. Core records are:
 
-- `Hypervisor`: ID, inventory source, address, enabled/draining state,
+- `Hypervisor`: ID, inventory identity, address, enabled/draining state,
   allocatable limits, capabilities, IPAM subnet ID/prefix, agent identity, and
   last heartbeat. One enabled hypervisor maps to one IPAM allocation subnet.
 - `VMRequest`: ID, caller/idempotency key, requested RAM/vCPUs, network/image
@@ -259,11 +258,13 @@ not encrypt traffic. The infrastructure administrator is responsible for DNS
 and reachability for EPMD (or the chosen EPMD-less alternative) and the
 distribution-port range between all nodes.
 
-`libvirtex_cluster` should use a static, inventory-derived libcluster topology
-first; later it may add a provider-aware strategy as hypervisors are created.
-It exposes a registry/watch interface to applications, reconnects after node
-loss, and triggers full HSM/CCM state re-synchronization on rejoin. It must not
-infer that a node is healthy simply because it is connected. The control service
+`libvirtex_cluster` uses a configured, inventory-derived libcluster topology.
+An HSM authenticates and registers with CCM after joining that topology; CCM
+matches the registration to the configured inventory and enables the HSM only
+after its initial reconciliation and health report. It exposes a
+registry/watch interface to applications, reconnects after node loss, and
+triggers full HSM/CCM state re-synchronization on rejoin. It must not infer
+that a node is healthy simply because it is connected. The control service
 still exposes HTTPS JSON for operators and automation, including VM requests,
 inventory, agents, operations, and drain/enable actions.
 
@@ -276,7 +277,9 @@ reconciliation for already committed VMs.
 
 Run the CCM as a Podman container on the bastion, supervised by a generated
 systemd unit. Give it persistent mounts only for required configuration and
-TLS material. PostgreSQL runs as a separate, isolated Podman container on the
+TLS material, including a read-only Podman volume that makes the inventory file
+available at CCM's configured inventory-file path. PostgreSQL runs as a
+separate, isolated Podman container on the
 bastion with a dedicated local volume mounted at its data directory; this volume
 is the durable database boundary and must be backed up by the administrator.
 Because CCM uses host networking for distributed Erlang, it connects to
@@ -295,10 +298,21 @@ run a dedicated service account, limit image provenance, and do not mount broad
 host paths or IPAM credentials. The bastion hosts the CCM container, PostgreSQL
 access, backups, and deployment-platform supplied secrets.
 
-Static inventory is imported from a versioned file or source adapter and
-reconciled into the database. Auto-provisioning is opt-in: the scheduler asks
-the provisioner only when no static candidate can fulfill a request, then
-waits for the new host's authenticated agent registration before placement.
+CCM receives the path to a versioned hypervisor inventory file through its
+runtime configuration. Podman makes that file available to the CCM container
+through a read-only volume mounted at the configured path. At startup CCM
+validates the file and loads it as the authoritative inventory snapshot: within
+one database transaction it overwrites the existing `Hypervisor` host entries
+rather than merging or retaining entries from a previous file. The configured
+file is therefore the sole mechanism for adding, changing, or removing hosts
+from inventory.
+
+Each host listed in that snapshot runs an HSM which authenticates and registers
+itself with CCM. CCM records the registration identity, address, capabilities,
+and initial reconciliation state against its loaded inventory entry. A
+registered HSM becomes available for placement only after inventory validation
+and a healthy reconciliation report. Dynamically provisioning or enrolling
+unconfigured hypervisors is out of scope.
 
 CoreDNS access is configured as a distinct infrastructure integration with the
 least privilege needed to update the managed Corefile section and reload the
@@ -377,12 +391,13 @@ role/topology decisions in the UI and audit trail. Test all role combinations,
 conflicting rules, concurrent offers, restart recovery, and IPAM fallback where
 only a topology-valid alternate HSM may be elected.
 
-### Phase 4 — Fleet and provisioning
+### Phase 4 — Fleet operations
 
 Support multiple agents, utilization-aware ranking, inventory source refresh,
-and a provider-backed hypervisor provisioner. Add admission limits, provisioning
-quotas, decommission/drain workflow, capacity reporting, and load/failure tests
-at representative fleet size.
+and authenticated HSM self-registration. Add admission limits,
+decommission/drain workflow, capacity reporting, and load/failure tests at
+representative fleet size. Creating or provisioning hypervisors remains out of
+scope.
 
 ### Phase 5 — Advanced capacity policy
 
