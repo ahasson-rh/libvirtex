@@ -15,10 +15,13 @@ after host loss, or multi-region consensus.
 ## Operating Assumptions and Scope
 
 The bastion and hypervisors are on an administrator-managed flat network.
-Network reachability, routing, DNS, firewall policy, and the underlying bastion
-and hypervisor infrastructure are the infrastructure administrator's
-responsibility. Libvirtex assumes that CCM and every HSM can reach each other
-over the configured authenticated control channel.
+Network reachability, routing, firewall policy, and the underlying bastion and
+hypervisor infrastructure are the infrastructure administrator's
+responsibility. CoreDNS is an assumed part of that infrastructure. Libvirtex
+manages the VM IP-to-name records in the administrator-designated CoreDNS
+zone, but does not provision or otherwise administer the CoreDNS service,
+network, or zone delegation. Libvirtex assumes that CCM and every HSM can
+reach each other over the configured authenticated control channel.
 
 Provisioning KVM, libvirt, host networking, storage, and related hypervisor
 dependencies is out of scope at this stage. Ansible and Podman are also assumed
@@ -37,6 +40,7 @@ CommandControlModule (Podman on bastion) ---- PostgreSQL (separate Podman contai
    |        |       \
    |        |        \-- IPAM provider
    |        +----------- hypervisor provisioner (optional)
+   |        +----------- CoreDNS Corefile record manager
    |
  libcluster / distributed Erlang / shared request registry
    |
@@ -64,6 +68,7 @@ the HSM's atomic local reservation ledger is authoritative for a host.
 | `libvirtex_core` | structs, state transitions, validation, behaviours, request/event schemas | database, transport, or provider implementations |
 | `libvirtex_cluster` | libcluster topology, node naming, Mnesia schema/tables, cluster event handling, and shared-registry interface | libvirt calls or host-local resource admission |
 | `libvirtex_ipam` | `IPAM` behaviour and adapters for reserve, confirm, release, lookup | placement decisions or VM creation |
+| `libvirtex_dns` | `DNSRecords` behaviour and adapters that inject/delete managed VM records in the CoreDNS Corefile | DNS service provisioning, zone delegation, or arbitrary Corefile configuration |
 | `libvirtex_provisioner` | `Provisioner` behaviour and adapters that create/register hosts | host scheduling policy |
 
 Start `libvirtex_core` as an independent app. Keep the IPAM and provisioner
@@ -98,6 +103,9 @@ Persist immutable IDs and explicit state transitions. Core records are:
 - `IPLease`: provider reference, address/prefix/network, state, and VM request
   ID, hypervisor ID, and IPAM subnet ID. Store no provider secrets in this
   record.
+- `DNSRecord`: VM request ID, fully qualified name, address, zone, provider
+  reference, and lifecycle state. It is associated with the confirmed IP lease
+  and stores no CoreDNS administration credentials.
 - `VMRecord`: VM request ID, domain identity, elected HSM, reservation and
   lease references, role, workload ID, desired/observed state, and placement
   generation. It is owned locally by that VM's HSM agent and replicated as
@@ -110,9 +118,12 @@ Persist immutable IDs and explicit state transitions. Core records are:
   authentication/provider errors.
 
 Suggested lifecycle: `requested -> placing -> reserved -> ip_reserved ->
-provisioning -> running`; failures move to `failed` after compensating release
-of reservation and unconfirmed lease. Deletion is `deleting -> absent`. A
-running VM whose agent disappears becomes `unknown`, not immediately deleted.
+provisioning -> running`; after the VM is confirmed, CCM injects its DNS record
+and marks it published. Failures move to `failed` after compensating release of
+the DNS record, reservation, and unconfirmed lease as applicable. Deletion is
+`deleting -> absent`: CCM removes the DNS record before releasing the address,
+and records a retryable operation if removal cannot yet be confirmed. A running
+VM whose agent disappears becomes `unknown`, not immediately deleted.
 
 ## VM Roles and Placement Topology
 
@@ -215,6 +226,28 @@ do not consume scheduler reservations until an explicit import policy exists.
 VM definitions carry the Libvirtex VM ID and placement generation in metadata
 so retries cannot operate on the wrong guest.
 
+## CoreDNS Record Management
+
+CCM owns the desired DNS record for every scheduled VM. Once an HSM confirms a
+VM and its IP lease, CCM creates or reconciles the VM's configured FQDN-to-IP
+mapping in CoreDNS. When a VM is retired, CCM removes that mapping before its
+address is released for reuse. The record operation is part of the durable VM
+workflow: it has an idempotency key, audit record, bounded retry, and explicit
+success or failure state. A failed CoreDNS update must leave the VM and lease
+intact for reconciliation rather than silently releasing an address that could
+still be published.
+
+`libvirtex_dns` defines a small `DNSRecords` behaviour, initially with
+idempotent `inject_vm_record` and `delete_vm_record` operations. Both accept
+the Libvirtex VM ID, FQDN, address, and zone; deletion also accepts the
+provider record reference when one exists. The implementation owns only a
+Libvirtex-managed section of the configured CoreDNS Corefile. It must preserve
+administrator-managed configuration, serialize concurrent Corefile updates,
+validate the resulting file with the CoreDNS binary, atomically install it,
+and trigger the configured safe CoreDNS reload mechanism. Reconciliation lists
+or derives the managed records and repairs drift without changing records
+outside that section.
+
 ## Service Interfaces and Deployment
 
 Use `libcluster` for Erlang node discovery and cluster formation. Give every
@@ -267,6 +300,14 @@ reconciled into the database. Auto-provisioning is opt-in: the scheduler asks
 the provisioner only when no static candidate can fulfill a request, then
 waits for the new host's authenticated agent registration before placement.
 
+CoreDNS access is configured as a distinct infrastructure integration with the
+least privilege needed to update the managed Corefile section and reload the
+service. Its credentials and Corefile path are supplied as runtime secrets and
+are never stored in `DNSRecord` or operation data. The infrastructure
+administrator owns CoreDNS availability, zone configuration, backups, and the
+initial managed-section marker; Libvirtex owns the contents between that
+marker for VM records.
+
 ## Ansible Provisioning
 
 Use Ansible to deploy or update CCM, HSM, and dedicated PostgreSQL Podman
@@ -313,7 +354,8 @@ and reconciliation loop. Implement a minimal control API with PostgreSQL,
 static inventory, Mnesia registry, offer/election protocol, supervised VM
 Agents, and an in-memory/fake subnet-aware IPAM adapter. Prove concurrent
 offers, single CCM election, IP allocation from the elected HSM's subnet,
-idempotent retry, delete, and reservation expiry against a test hypervisor.
+idempotent retry, delete, CoreDNS record injection/deletion, and reservation
+expiry against a test hypervisor.
 This phase establishes the safety invariant: a host never accepts resources
 beyond its configured limits.
 
@@ -386,7 +428,11 @@ state machine.
 - Hard role-based affinity and anti-affinity rules are honored during both
   normal and IPAM-fallback election; an invalid alternate HSM is never chosen.
 - A successfully created VM has one recorded placement and one confirmed IPAM
-  lease; failed workflows leave neither active reservation nor leaked lease.
+  lease, plus one managed CoreDNS mapping; failed workflows leave neither an
+  active reservation nor a leaked lease or DNS record.
+- Retiring a VM removes its CoreDNS mapping before its IP address becomes
+  available for a new lease; retry/reconciliation repairs failed or drifted
+  record updates without altering administrator-managed CoreDNS configuration.
 - Scheduler and control-service restarts recover in-progress operations without
   duplicating a VM or consuming capacity twice.
 - An unreachable or draining hypervisor receives no new placements, while its
