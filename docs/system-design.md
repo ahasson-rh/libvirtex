@@ -50,6 +50,70 @@ DynamicSupervisor -> VM Agent (one per managed VM) -> libvirt local socket/API
                                                 libvirtd ---- VMs
 ```
 
+### Comprehensive Design Diagram
+
+```mermaid
+flowchart TB
+  operator["Operator / automation"] --> api["Phoenix UI + REST API"]
+
+  subgraph bastion["Bastion (Podman host network)"]
+    ccm["CommandControlModule (CCM)"]
+    postgres[("PostgreSQL<br/>operator data, audit history, workflows")]
+    inventory["Versioned hypervisor inventory file<br/>read-only Podman volume"]
+
+    api --> ccm
+    inventory -->|"configured file path; authoritative replace"| ccm
+    ccm -->|"persistence"| postgres
+  end
+
+  subgraph integrations["Infrastructure integrations"]
+    ipam["IPAM adapter<br/>reserve / confirm / release / lookup"]
+    dns["DNSRecords adapter<br/>inject_vm_record / delete_vm_record"]
+    coredns["CoreDNS<br/>managed Corefile record section"]
+
+    dns -->|"validate, atomically update, reload"| coredns
+  end
+
+  ccm -->|"idempotent lease operations"| ipam
+  ccm -->|"idempotent VM DNS operations"| dns
+
+  subgraph cluster["Distributed Erlang cluster"]
+    topology["libvirtex_cluster + libcluster<br/>TLS distribution, inventory-derived topology"]
+    mnesia[("Mnesia disc_copies<br/>requests, offers, placements, VM records, HSM reports")]
+    registry["Shared registry / watch interface"]
+
+    topology --- mnesia
+    mnesia --- registry
+  end
+
+  ccm <-->|"sole election authority;<br/>workflow commands and reports"| registry
+
+  subgraph hypervisor["Configured hypervisor (one HSM per host; Podman --network host)"]
+    hsm["HypervisorSchedulerModule (HSM)"]
+    ledger[("Durable local reservation ledger<br/>atomic admission authority")]
+    supervisor["DynamicSupervisor"]
+    agent["VM Agent<br/>ensure / delete / reconcile"]
+    libvirt["libvirt local socket/API"]
+    libvirtd["libvirtd"]
+    vm["Managed VM"]
+
+    hsm -->|"atomic holds, commits, releases"| ledger
+    hsm --> supervisor --> agent --> libvirt --> libvirtd --> vm
+    agent -->|"observed VM state"| hsm
+  end
+
+  hsm -->|"authenticate and self-register;<br/>heartbeat and reconciliation"| ccm
+  hsm <-->|"requests, offers, placement and VM state"| registry
+
+  ccm -->|"1. publish request"| registry
+  registry -->|"2. eligible HSM makes held offer"| hsm
+  ccm -->|"3. elect one offer; CommitReservation"| hsm
+  ccm -->|"4. reserve address after commit"| ipam
+  ccm -->|"5. EnsureVM with lease and reservation"| hsm
+  ccm -->|"6. publish DNS after VM confirmation"| dns
+  ccm -->|"7. delete DNS before address release"| dns
+```
+
 `CommandControlModule` is the source of truth for the loaded inventory, VM
 desired state, workflow progress, placements, and IPAM lease references. CCM
 receives the authoritative inventory-file path as configuration. Each
